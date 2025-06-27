@@ -46,6 +46,10 @@ const setUserSelections = async (req, res) => {
             return res.status(400).json({ message: 'Formato inválido.' });
         }
 
+        if (selections.some(s => s.day === 'Lunes')) {
+            return res.status(400).json({ message: 'No se puede seleccionar lunes. Estará disponible próximamente.' });
+        }
+
         const user = await User.findById(userId);
         if (!user) return res.status(404).json({ message: 'Usuario no encontrado.' });
 
