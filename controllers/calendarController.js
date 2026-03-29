@@ -1,11 +1,24 @@
 // controllers/calendarController.js
 const UserSelection = require('../models/UserSelection');
-const User = require('../models/User'); // Para consultar diasSemanales del usuario
-const Holiday = require('../models/Holiday'); // Para consultar feriados
-const RecoverableTurn = require('../models/RecoverableTurn'); // Para manejar turnos recuperables
+const User = require('../models/User');
+const Holiday = require('../models/Holiday');
+const RecoverableTurn = require('../models/RecoverableTurn');
+const ScheduleConfig = require('../models/ScheduleConfig');
+const ClosedSlot = require('../models/ClosedSlot');
+
+// Horario base que se usa para inicializar la base de datos la primera vez
+const DEFAULT_SCHEDULE = {
+    martes:  ['07:00', '08:00', '09:00', '17:00', '18:00', '19:00', '20:00'],
+    jueves:  ['07:00', '08:00', '09:00', '17:00', '18:00', '19:00', '20:00'],
+    viernes: ['08:00', '09:00'],
+};
 
 // Función para normalizar un string (quita espacios extras y pasa a minúsculas)
 const normalizar = (str) => str.trim().replace(/\s+/g, ' ').toLowerCase();
+
+// Filtra entradas placeholder que se usan para marcar "sin turnos esta semana"
+const filtrarPlaceholders = (selections) =>
+    selections.filter(s => s.day !== '__placeholder__');
 
 // Helper para saber si estamos en el mismo mes/año
 function sameMonth(date1, date2) {
@@ -25,14 +38,18 @@ const getUserSelections = async (req, res) => {
             return res.json({ selections: [] });
         }
 
-        const selectionsToShow = userSelection.temporarySelections.length > 0
-            ? userSelection.temporarySelections
+        const hasTemporary = userSelection.temporarySelections.length > 0 &&
+            !userSelection.temporarySelections.every(s => s.day === '__placeholder__');
+
+        const selectionsToShow = hasTemporary
+            ? filtrarPlaceholders(userSelection.temporarySelections)
             : userSelection.originalSelections;
 
         return res.json({
             selections: selectionsToShow,
             originalSelections: userSelection.originalSelections || [],
-            changesThisMonth: userSelection.changesThisMonth || 0
+            changesThisMonth: userSelection.changesThisMonth || 0,
+            tieneTemporales: userSelection.temporarySelections.length > 0
         });
     } catch (error) {
         console.error(error);
@@ -54,10 +71,9 @@ const setUserSelections = async (req, res) => {
         const user = await User.findById(userId);
         if (!user) return res.status(404).json({ message: 'Usuario no encontrado.' });
 
-        
         const maxDias = user.diasSemanales;
         let userSelection = await UserSelection.findOne({ user: userId });
-        
+
         const now = new Date();
 
         // Validar bloqueo por falta de pago
@@ -105,7 +121,7 @@ const setUserSelections = async (req, res) => {
             }
         }
 
-        // Aplicar cambio temporal (El mes que viene volver a original)
+        // Aplicar cambio temporal
         if (userSelection.lastChange && sameMonth(now, userSelection.lastChange)) {
             if (userSelection.changesThisMonth >= 2) {
                 return res.status(403).json({ message: 'Ya alcanzaste el límite de 2 cambios este mes.' });
@@ -146,7 +162,6 @@ const setOriginalSelections = async (req, res) => {
 
         const userSelection = await UserSelection.findOne({ user: userId });
         if (!userSelection) {
-            // Si no existía, lo creamos
             const nuevo = new UserSelection({
                 user: userId,
                 originalSelections: selections,
@@ -231,13 +246,16 @@ const resetUserSelections = async (req, res) => {
 const getAllTurnosPorHorario = async (req, res) => {
     try {
         const allSelections = await UserSelection.find().populate('user', 'nombre apellido');
-    
+
         const turnosMap = {};
 
         allSelections.forEach(sel => {
             const { originalSelections = [], temporarySelections = [] } = sel;
-            const usarTemporales = temporarySelections.length > 0;
-            const source = usarTemporales ? temporarySelections : originalSelections;
+            const tieneTemporalesReales = temporarySelections.some(s => s.day !== '__placeholder__');
+            const usarTemporales = temporarySelections.length > 0 && tieneTemporalesReales;
+            const source = usarTemporales
+                ? filtrarPlaceholders(temporarySelections)
+                : originalSelections;
 
             source.forEach(({ day, hour }) => {
                 const key = `${day}-${hour}`;
@@ -289,29 +307,27 @@ const adminMoverUsuario = async (req, res) => {
             return res.status(400).json({ message: 'Faltan datos requeridos.' });
         }
 
-        // Normalizamos el nombre recibido
         const nombreBuscado = normalizar(userFullName);
 
-        // Traemos todos los usuarios y comparamos contra su nombre completo
         const todos = await User.find({});
         const user = todos.find(u => {
             const nombreCompleto = normalizar(`${u.nombre} ${u.apellido}`);
             return nombreCompleto === nombreBuscado;
         });
 
-        if (!user) return res.status(404).json({ message: 'Usuario no encontrado.' });
+        if (!user) {
+            return res.status(404).json({ message: 'Usuario no encontrado.' });
+        }
 
         const userSelection = await UserSelection.findOne({ user: user._id });
         if (!userSelection) return res.status(404).json({ message: 'El usuario no tiene turnos asignados.' });
 
         if (!userSelection.originalSelections) userSelection.originalSelections = [];
 
-        // 1. Eliminar el turno actual de originalSelections
         userSelection.originalSelections = userSelection.originalSelections.filter(
             t => !(t.day === current.day && t.hour === current.hour)
         );
 
-        // 2. Agregar nuevo turno si no está repetido
         const yaExiste = userSelection.originalSelections.some(
             t => t.day === newTurn.day && t.hour === newTurn.hour
         );
@@ -328,16 +344,15 @@ const adminMoverUsuario = async (req, res) => {
     }
 };
 
+
 // Admin: Restaurar turnos originales y devolver cambio mensual
 const adminResetToOriginals = async (req, res) => {
     try {
         const { userFullName } = req.body;
         if (!userFullName) return res.status(400).json({ message: 'Falta el nombre del usuario.' });
 
-        // Normalizamos el nombre recibido
         const nombreBuscado = normalizar(userFullName);
 
-        // Traemos todos los usuarios y comparamos contra su nombre completo
         const todos = await User.find({});
         const user = todos.find(u => {
             const nombreCompleto = normalizar(`${u.nombre} ${u.apellido}`);
@@ -356,7 +371,6 @@ const adminResetToOriginals = async (req, res) => {
         userSelection.temporarySelections = [];
         userSelection.lastChange = null;
 
-        // Restar un cambio mensual si tiene al menos uno registrado
         if (userSelection.changesThisMonth && userSelection.changesThisMonth > 0) {
             userSelection.changesThisMonth -= 1;
         }
@@ -370,7 +384,6 @@ const adminResetToOriginals = async (req, res) => {
     }
 };
 
-
 // Admin: Cancelar un turno temporalmente
 const adminCancelarTurnoTemporalmente = async (req, res) => {
     try {
@@ -380,10 +393,8 @@ const adminCancelarTurnoTemporalmente = async (req, res) => {
             return res.status(400).json({ message: 'Faltan datos requeridos.' });
         }
 
-        // Normalizamos el nombre recibido
         const nombreBuscado = normalizar(userFullName);
 
-        // Traemos todos los usuarios y comparamos contra su nombre completo
         const todos = await User.find({});
         const user = todos.find(u => {
             const nombreCompleto = normalizar(`${u.nombre} ${u.apellido}`);
@@ -403,7 +414,6 @@ const adminCancelarTurnoTemporalmente = async (req, res) => {
             t => !(t.day === day && t.hour === hour)
         );
 
-        // Si se eliminan todos, dejamos un placeholder
         userSelection.temporarySelections = nuevosTemporales.length > 0
             ? nuevosTemporales
             : [{ day: '__placeholder__', hour: '__none__' }];
@@ -420,8 +430,7 @@ const adminCancelarTurnoTemporalmente = async (req, res) => {
 };
 
 
-//FERIADOS
-// Marcar un feriado
+// FERIADOS
 const marcarFeriado = async (req, res) => {
     const { date } = req.body;
     if (!date) return res.status(400).json({ message: 'Falta la fecha del feriado.'});
@@ -437,10 +446,8 @@ const marcarFeriado = async (req, res) => {
         console.error(error);
         res.status(500).json({ message: 'Error al guardar el feriado.' });
     }
+};
 
-}
-
-// Obtener todos los feriados
 const getFeriados = async (req, res) => {
     try {
         const feriados = await Holiday.find();
@@ -451,7 +458,6 @@ const getFeriados = async (req, res) => {
     }
 };
 
-// Eliminar un feriado
 const quitarFeriado = async (req, res) => {
     const { date } = req.body;
     if (!date) return res.status(400).json({ message: 'Falta la fecha.' });
@@ -479,7 +485,6 @@ const guardarTurnoParaRecuperar = async (req, res) => {
             return res.status(404).json({ message: 'Usuario no encontrado.' });
         }
 
-        // Validar bloqueo por falta de pago
         const hoy = new Date();
         if (!user.pago && hoy.getDate() > 10) {
             return res.status(403).json({ message: 'Debés realizar tu pago correspondiente para cambiar o recuperar turnos.' });
@@ -490,20 +495,19 @@ const guardarTurnoParaRecuperar = async (req, res) => {
             return res.status(404).json({ message: 'No hay selección registrada.' });
         }
 
-        // Lógica de conteo mensual
-        const sameMonth = userSelection.lastChange &&
-        userSelection.lastChange.getMonth() === hoy.getMonth() &&
-        userSelection.lastChange.getFullYear() === hoy.getFullYear();
+        const sameMonthCheck = userSelection.lastChange &&
+            userSelection.lastChange.getMonth() === hoy.getMonth() &&
+            userSelection.lastChange.getFullYear() === hoy.getFullYear();
 
-        if (sameMonth) {
-                if (userSelection.changesThisMonth >= 2) {
-                    return res.status(403).json({ message: 'Ya alcanzaste el límite de 2 cambios este mes.' });
-                } else {
-                    userSelection.changesThisMonth += 1;
-                }
+        if (sameMonthCheck) {
+            if (userSelection.changesThisMonth >= 2) {
+                return res.status(403).json({ message: 'Ya alcanzaste el límite de 2 cambios este mes.' });
             } else {
-                userSelection.changesThisMonth = 1;
+                userSelection.changesThisMonth += 1;
             }
+        } else {
+            userSelection.changesThisMonth = 1;
+        }
 
         userSelection.lastChange = hoy;
 
@@ -535,12 +539,11 @@ const listarTurnosRecuperables = async (req, res) => {
 
         const turnos = await RecoverableTurn.find({ user: userId, recovered: false });
 
-        // Devolver también la fecha formateada
         const turnosFormateados = turnos.map(t => ({
             _id: t._id,
             originalDay: t.originalDay,
             originalHour: t.originalHour,
-            cancelDate: t.cancelledWeek, // puede formatearse en el frontend
+            cancelDate: t.cancelledWeek,
         }));
 
         res.json(turnosFormateados);
@@ -569,28 +572,23 @@ const usarTurnoRecuperado = async (req, res) => {
 
         const diaCapitalizado = capitalize(day);
 
-        // Calcular fecha exacta del día elegido, basándonos en si hoy es sábado o domingo
         const today = new Date();
-        const dayOfWeek = today.getDay(); // 0 = domingo, 6 = sábado
+        const dayOfWeek = today.getDay();
         const dayIndex = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes'].indexOf(diaCapitalizado);
 
         const monday = new Date(today);
 
         if (dayOfWeek === 6) {
-            // sábado → saltamos al lunes siguiente
             monday.setDate(today.getDate() + 2);
         } else if (dayOfWeek === 0) {
-            // domingo → saltamos al lunes siguiente
             monday.setDate(today.getDate() + 1);
         } else {
-            // lunes a viernes → vamos al lunes actual
             monday.setDate(today.getDate() - ((dayOfWeek + 6) % 7));
         }
 
         const recoveryDate = new Date(monday);
         recoveryDate.setDate(monday.getDate() + dayIndex);
 
-        // Actualizar solo el modelo RecoverableTurn
         turno.recovered = true;
         turno.recoveryDate = recoveryDate;
         turno.assignedDay = diaCapitalizado;
@@ -618,7 +616,7 @@ const listarTurnosRecuperadosUsados = async (req, res) => {
 
         const start = new Date(startDate);
         const end = new Date(endDate);
-        end.setHours(23, 59, 59, 999); // incluir todo el último día
+        end.setHours(23, 59, 59, 999);
 
         const turnos = await RecoverableTurn.find({
             user: userId,
@@ -627,6 +625,7 @@ const listarTurnosRecuperadosUsados = async (req, res) => {
         });
 
         const resultados = turnos.map(t => ({
+            _id: t._id,
             day: t.assignedDay,
             hour: t.assignedHour,
             nombre: `${req.user.nombre} ${req.user.apellido}`,
@@ -658,7 +657,7 @@ const listarTodosLosTurnosRecuperadosUsados = async (req, res) => {
         }).populate('user', 'nombre apellido');
 
         const resultados = turnos
-            .filter(t => t.user) // Evita error si el usuario fue eliminado
+            .filter(t => t.user)
             .map(t => ({
                 day: t.assignedDay,
                 hour: t.assignedHour,
@@ -673,10 +672,11 @@ const listarTodosLosTurnosRecuperadosUsados = async (req, res) => {
     }
 };
 
+
 const limpiarTurnosRecuperadosViejos = async (req, res) => {
     try {
         const hoy = new Date();
-        const primerDiaMes = new Date(hoy.getFullYear(), hoy.getMonth(), 1); // ej: 2025-06-01
+        const primerDiaMes = new Date(hoy.getFullYear(), hoy.getMonth(), 1);
 
         const resultado = await RecoverableTurn.deleteMany({
             recovered: true,
@@ -692,19 +692,17 @@ const limpiarTurnosRecuperadosViejos = async (req, res) => {
     }
 };
 
-//ADMIN: Eliminar un turno recuperado y devolverlo al usuario
+// ADMIN: Eliminar un turno recuperado y devolverlo al usuario
 const adminEliminarTurnoRecuperado = async (req, res) => {
     try {
         const { userFullName, day, hour } = req.body;
 
         if (!userFullName || !day || !hour) {
             return res.status(400).json({ message: 'Faltan datos requeridos.' });
-        };
+        }
 
-        // Normalizamos el nombre recibido
         const nombreBuscado = normalizar(userFullName);
 
-        // Traemos todos los usuarios y comparamos contra su nombre completo
         const todos = await User.find({});
         const user = todos.find(u => {
             const nombreCompleto = normalizar(`${u.nombre} ${u.apellido}`);
@@ -713,7 +711,6 @@ const adminEliminarTurnoRecuperado = async (req, res) => {
 
         if (!user) return res.status(404).json({ message: 'Usuario no encontrado.' });
 
-        // Buscar el turno recuperado que coincida
         const turno = await RecoverableTurn.findOne({
             user: user._id,
             assignedDay: day,
@@ -725,7 +722,6 @@ const adminEliminarTurnoRecuperado = async (req, res) => {
             return res.status(404).json({ message: 'Turno recuperado no encontrado.' });
         }
 
-        // Revertimos el turno disponible
         turno.recovered = false;
         turno.recoveryDate = null;
         turno.assignedDay = null;
@@ -734,7 +730,7 @@ const adminEliminarTurnoRecuperado = async (req, res) => {
         await turno.save();
 
         return res.json({
-            message: `El turno recuperado de ${turno.user.nombre} ${turno.user.apellido} fue eliminado. Ahora puede volver a usarlo.`
+            message: `El turno recuperado de ${user.nombre} ${user.apellido} fue eliminado. Ahora puede volver a usarlo.`
         });
 
     } catch (error) {
@@ -777,6 +773,117 @@ const usuarioEliminarTurnoRecuperado = async (req, res) => {
     }
 };
 
+// ─── SCHEDULE CONFIG ──────────────────────────────────────────────────────────
+
+const getSchedule = async (req, res) => {
+    try {
+        const count = await ScheduleConfig.countDocuments();
+        if (count === 0) {
+            const docs = Object.entries(DEFAULT_SCHEDULE).map(([day, hours]) => ({ day, hours }));
+            await ScheduleConfig.insertMany(docs);
+        }
+        const schedules = await ScheduleConfig.find();
+        const result = {};
+        schedules.forEach(s => { result[s.day] = s.hours; });
+        res.json(result);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Error al obtener el horario.' });
+    }
+};
+
+const addHour = async (req, res) => {
+    try {
+        const { day, hour } = req.body;
+        if (!day || !hour) return res.status(400).json({ message: 'Faltan datos.' });
+
+        const config = await ScheduleConfig.findOne({ day });
+        if (!config) return res.status(404).json({ message: 'Día no encontrado.' });
+
+        if (config.hours.includes(hour)) {
+            return res.status(400).json({ message: 'Ese horario ya existe en ese día.' });
+        }
+
+        config.hours.push(hour);
+        config.hours.sort();
+        await config.save();
+
+        res.json({ message: `Horario ${hour} agregado al ${day}.`, hours: config.hours });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Error al agregar el horario.' });
+    }
+};
+
+const removeHour = async (req, res) => {
+    try {
+        const { day, hour } = req.body;
+        if (!day || !hour) return res.status(400).json({ message: 'Faltan datos.' });
+
+        const config = await ScheduleConfig.findOne({ day });
+        if (!config) return res.status(404).json({ message: 'Día no encontrado.' });
+
+        if (!config.hours.includes(hour)) {
+            return res.status(400).json({ message: 'Ese horario no existe en ese día.' });
+        }
+
+        config.hours = config.hours.filter(h => h !== hour);
+        await config.save();
+
+        res.json({ message: `Horario ${hour} eliminado del ${day}.`, hours: config.hours });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Error al eliminar el horario.' });
+    }
+};
+
+// ─── CLOSED SLOTS ─────────────────────────────────────────────────────────────
+
+const getClosedSlots = async (req, res) => {
+    try {
+        const { startDate, endDate } = req.query;
+        const filter = {};
+        if (startDate && endDate) {
+            filter.date = { $gte: startDate, $lte: endDate };
+        }
+        const slots = await ClosedSlot.find(filter);
+        res.json(slots);
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Error al obtener los horarios cerrados.' });
+    }
+};
+
+const cerrarHorario = async (req, res) => {
+    try {
+        const { date, hour } = req.body;
+        if (!date || !hour) return res.status(400).json({ message: 'Faltan datos.' });
+
+        await ClosedSlot.findOneAndUpdate(
+            { date, hour },
+            { date, hour },
+            { upsert: true, new: true }
+        );
+
+        res.json({ message: `Horario ${hour} del ${date} marcado como cerrado.` });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Error al cerrar el horario.' });
+    }
+};
+
+const abrirHorario = async (req, res) => {
+    try {
+        const { date, hour } = req.body;
+        if (!date || !hour) return res.status(400).json({ message: 'Faltan datos.' });
+
+        await ClosedSlot.deleteOne({ date, hour });
+        res.json({ message: `Horario ${hour} del ${date} reabierto.` });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: 'Error al reabrir el horario.' });
+    }
+};
 
 module.exports = {
     getUserSelections,
@@ -798,5 +905,13 @@ module.exports = {
     listarTodosLosTurnosRecuperadosUsados,
     adminResetToOriginals,
     adminEliminarTurnoRecuperado,
-    usuarioEliminarTurnoRecuperado
+    usuarioEliminarTurnoRecuperado,
+    // Schedule config
+    getSchedule,
+    addHour,
+    removeHour,
+    // Closed slots
+    getClosedSlots,
+    cerrarHorario,
+    abrirHorario,
 };
